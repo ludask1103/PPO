@@ -1,13 +1,14 @@
-using Flux, Plots, ReinforcementLearningBase
+using Flux, Plots, ReinforcementLearning
 using Flux.Optimise: update!
 
 mutable struct Trajectory
-    state   ::Vector{Float64}
-    action  ::Vector{Int64}  
-    prob    ::Vector{Float64}
-    reward  ::Vector{Float64}
-    values  ::Vector{Float64}
-    done    ::Vector{Bool}   
+    state     ::Vector{Vector{Float64}}
+    action    ::Vector{Int64}  
+    prob      ::Vector{Vector{Float64}}
+    reward    ::Vector{Float64}
+    value     ::Vector{Float64}
+    done      ::Vector{Bool}   
+    advantage ::Vector{Float64}
     
     function Trajectory()
         new(
@@ -16,7 +17,20 @@ mutable struct Trajectory
             Float64[],
             Float64[],
             Float64[],
-            Bool[]
+            Bool[],
+            Float64[]
+        )
+    end
+end
+
+mutable struct training_process
+    ep_wise::Vector{Float64}
+    policy_wise::Vector{Float64}
+
+    function training_process()
+        new(
+            Float64[],
+            Float64[]
         )
     end
 end
@@ -34,33 +48,84 @@ end
 
 function run_policy(
     env::AbstractEnv, 
-    actor::Chain, 
+    actor::Chain,
+    critic::Chain, 
     T::Int64
     )::Trajectory
     traj = Trajectory()
 
-    for i in 1:T
-        
+    for _ in 1:T
+        if is_terminated(env)
+            reset!(env)
+        end
+        s = state(env)
+        probs = actor(s)
+        a = argmax(probs)
+        env(a)
+        r = reward(env)
+        v = critic(s)[1]
+
+        push!(traj.state, s)
+        push!(traj.prob, probs)
+        push!(traj.action, a)
+        push!(traj.reward, r)
+        push!(traj.value, v)
+        push!(traj.done, is_terminated(env))
     end
+
+    return traj
 end
 
-function advantage_estimate(trajectory::Trajectory)::Vector{Float32}
+function advantage_estimate(
+    traj::Trajectory,
+    γ::Float64=0.99,
+    λ::Float64=0.95
+    )::Trajectory
+    
+    A_prime = 0
+    push!(traj.advantage, A_prime)
+
+    T = length(traj.action)
+    for i in T-1:-1:1
+        mask = 1.0 - traj.done[i] #need to ignore next value if it is part of a new session 
+        A_prime *= mask  
+        δ = traj.reward[i] + γ*traj.value[i+1]*mask - traj.value[i]
+
+        A = δ + γ*λ*A_prime
+
+        pushfirst!(traj.advantage, A)
+
+        A_prime = A
+    end
+
+    return traj
+end
+
+function calculate_loss(traj::Trajectory,
+    c_1::Int64=1
+    )::Vector{Vector{Float64}}
+
+    
+end
+
+function update_params()
 
 end
 
 function main()
-
-    num_actions, num_states = length(action_space), length(state_space)
-
     env = CartPoleEnv()
+    num_actions, num_states = length(action_space(env)), length(state_space(env))
 
     actor = create_network(4,[num_states,64,64,num_actions],[tanh,tanh,identity])
     critic = create_network(4,[num_states,64,64,1],[tanh,tanh,identity])
 
     optimiser = Adam()
 
-    traj = Trajectory()
-    
+    traj = run_policy(env,actor,critic,5) |> advantage_estimate
+    println(traj)
+    println(traj.advantage)
+    println(traj.action)
+
 end
 
 main()
