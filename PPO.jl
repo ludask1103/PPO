@@ -2,11 +2,23 @@ using Flux, Plots, ReinforcementLearningBase
 using Flux.Optimise: update!
 
 mutable struct Trajectory
-    state
-    action 
-    reward 
-    values 
-    done 
+    state   ::Vector{Float64}
+    action  ::Vector{Int64}  
+    prob    ::Vector{Float64}
+    reward  ::Vector{Float64}
+    values  ::Vector{Float64}
+    done    ::Vector{Bool}   
+    
+    function Trajectory()
+        new(
+            Float64[],
+            Int64[],
+            Float64[],
+            Float64[],
+            Float64[],
+            Bool[]
+        )
+    end
 end
 
 function create_network(
@@ -20,19 +32,34 @@ function create_network(
     return Chain(network...)
 end
 
-function advantage_estimate(trajectory)
+function run_policy(
+    env::AbstractEnv, 
+    actor::Chain, 
+    T::Int64
+    )::Trajectory
+    traj = Trajectory()
+
+    for i in 1:T
+        
+    end
+end
+
+function advantage_estimate(trajectory::Trajectory)::Vector{Float32}
 
 end
 
 function main()
 
-    env = CartPoleEnv()
     num_actions, num_states = length(action_space), length(state_space)
+
+    env = CartPoleEnv()
 
     actor = create_network(4,[num_states,64,64,num_actions],[tanh,tanh,identity])
     critic = create_network(4,[num_states,64,64,1],[tanh,tanh,identity])
 
     optimiser = Adam()
+
+    traj = Trajectory()
     
 end
 
