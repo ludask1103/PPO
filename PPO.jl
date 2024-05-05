@@ -4,30 +4,6 @@ theme(:ggplot2)
 
 rng = StableRNG(1)
 
-mutable struct ADAM
-    eta::Float64
-    beta::Tuple{Float64,Float64}
-    epsilon::Float64
-    state::IdDict
-  end
-  
-  ADAM(η = 0.001, β = (0.9, 0.999), ϵ = 1e-5) = ADAM(η, β, ϵ, IdDict())
-  
-  function apply!(o::ADAM, x, Δ)
-    η, β, ϵ = o.eta, o.beta, o.epsilon
-  
-    mt, vt, βp = get!(o.state, x) do
-        (zero(x), zero(x), Float64[β[1], β[2]])
-    end :: Tuple{typeof(x),typeof(x),Vector{Float64}}
-  
-    @. mt = β[1] * mt + (1 - β[1]) * Δ
-    @. vt = β[2] * vt + (1 - β[2]) * Δ^2
-    @. Δ =  mt / (1 - βp[1]) / (√(vt / (1 - βp[2])) + ϵ) * η
-    βp .= βp .* β
-  
-    return Δ
-  end
-
 mutable struct Trajectory
     state     ::Vector{Vector{Float64}}
     action    ::Vector{Int64}  
@@ -72,8 +48,11 @@ function run_policy(
         end
         s = state(worker.environment)
         probs = worker.agent.actor(s)
+        probs = softmax(probs)
+
         a = wsample(rng,collect(1:length(probs)),probs)
         worker.environment(a)
+
         r = reward(worker.environment)
         v = worker.agent.critic(s)[1]
 
@@ -88,8 +67,8 @@ function run_policy(
     return worker
 end
 
-function advantage_estimate(
-    worker::Worker,
+function calculate_advantage_estimate(
+    worker::Worker,               
     γ::Float64=0.99,
     λ::Float64=0.95
     )::Worker
@@ -150,7 +129,7 @@ function create_mini_batches(
 
     return batch_ind
 end
-
+L_e, L_value, L_cl, L = [], [], [], []
 function update_params(
     optimizer,
     global_traj::Trajectory,
@@ -164,16 +143,16 @@ function update_params(
     )    
 
     NT = length(global_traj.advantage)
-
+    
     for k in 1:n_epochs
         batch_ind = create_mini_batches(NT, batch_size)
         
         for ind in batch_ind
 
             adv = global_traj.advantage[ind]
-            adv = (adv.-mean(adv))./std(adv)
+            #adv = (adv.-mean(adv))./std(adv)
 
-            target_value = adv .+ global_traj.value[ind]
+            target_value = global_traj.reward[ind]
 
             states = transpose(stack(global_traj.state[ind],dims=1))
             actions = global_traj.action[ind]
@@ -185,28 +164,56 @@ function update_params(
 
                 value = global_critic(states)
                 prob = global_actor(states)
+
+                prob = logsoftmax(prob)
+
                 prob_a = [prob[:,i][a] for (i,a) in enumerate(actions)]
                 
                 L_vf = mean((value .- target_value).^2)
-                ratio = prob_a ./ prob_old
+                ratio = exp.(prob_a .- prob_old)
 
                 surr_1 = ratio .* adv
                 surr_2 = clamp.(ratio,1-ϵ,1+ϵ).*adv
 
                 L_clip = mean(min.(surr_1, surr_2))
 
-                L_entropy = entropy(prob)
+                L_entropy = -sum(exp.(prob) .* prob) * 1 // size(prob, 2)
 
-                L_clip + c_1*L_vf - c_2*L_entropy
+                -(L_clip - c_1*L_vf + c_2*L_entropy)
             end
+
+            value = global_critic(states)
+            prob = global_actor(states)
+
+            prob = softmax(prob)
+            
+            prob = log.(prob)
+
+            prob_a = [prob[:,i][a] for (i,a) in enumerate(actions)]
+            
+            L_vf = mean((value .- target_value).^2)
+            ratio = exp.(prob_a .- prob_old)
+
+            surr_1 = ratio .* adv
+            surr_2 = clamp.(ratio,1-ϵ,1+ϵ).*adv
+
+            L_clip = mean(min.(surr_1, surr_2))
+
+            L_entropy = -sum(exp.(prob) .* prob) * 1 // size(prob, 2)
 
             clip_by_global_norm!(gs, ps, 0.5f0)
             Flux.update!(optimizer, ps, gs)
+
+            push!(L_e,mean(L_entropy))
+            push!(L_value,mean(L_vf))
+            push!(L_cl,mean(L_clip))
+            push!(L,mean(-L_clip + c_1*L_vf - c_2*L_entropy))
+            
         end
     end
 end
 
-function reset_worker(global_actor::Chain, global_critic::Chain, worker::Worker)
+function update_worker(global_actor::Chain, global_critic::Chain, worker::Worker)
     worker.agent.actor = deepcopy(global_actor)
     worker.agent.critic = deepcopy(global_critic)
     worker.trajectory = Trajectory()
@@ -225,7 +232,7 @@ function test_actor(
         while !is_terminated(environment)
             s = state(environment)
             
-            probs = actor(s)
+            probs = softmax(actor(s))
             a = wsample(rng,collect(1:length(probs)),probs)
             
             environment(a)
@@ -238,9 +245,9 @@ end
 
 function main()
 
-    iterations = 100
-    time_steps = 128
-    n_envs = 4
+    iterations  = 30
+    time_steps  = 2048
+    n_envs      = 10
 
     n_epochs    = 10
     batch_size  = 64
@@ -250,12 +257,12 @@ function main()
 
     environment = CartPoleEnv(rng=rng)
     num_actions = length(action_space(environment))
-    num_states =  length(state_space(environment))
+    num_states  =  length(state_space(environment))
 
     actor::Chain = Chain(Dense(num_states => 64,tanh; init=glorot_uniform(rng)), 
                     Dense(64 => 64,tanh; init=glorot_uniform(rng)),  
-                    Dense(64 => num_actions; init=glorot_uniform(rng)), 
-                    softmax)
+                    Dense(64 => num_actions; init=glorot_uniform(rng))
+                    )
 
     critic::Chain = Chain(Dense(num_states => 64,tanh; init=glorot_uniform(rng)), 
                     Dense(64 => 64,tanh; init=glorot_uniform(rng)), 
@@ -264,29 +271,45 @@ function main()
     optimizer = Adam(2.5e-4)
 
     workers = [Worker(Trajectory(),Agent(actor,critic),CartPoleEnv(rng = StableRNG(hash(1+i))), time_steps) for i in 1:n_envs]
+    
+    r_baseline = []
+    span_baseline = ([],[])
+    for i in 1:iterations
+        rew, s, b = test_actor(actor,environment)
+        push!(r_baseline, rew)
+        push!(span_baseline[1],s)
+        push!(span_baseline[2],b)
+    end
+
     r = []
     span = ([],[])
     iter = ProgressBar(1:iterations)
 
     for i in iter
 
-        Threads.@threads for i in 1:n_envs
-            workers[i] = workers[i] |> run_policy |> advantage_estimate
-        end
+        workers = workers .|> run_policy .|> calculate_advantage_estimate
 
         traj = collect_trajectories(workers)
 
-        update_params(optimizer,traj,actor,critic,n_epochs,batch_size, c_1, c_2, ϵ)
+        update_params(optimizer,traj,actor,critic,n_epochs,batch_size,c_1,c_2,ϵ)
 
-        workers = [reset_worker(actor,critic,w) for w in workers]
+        workers = [update_worker(actor,critic,w) for w in workers]
         rew, s, b = test_actor(actor, environment)
         
         push!(r, rew)
         push!(span[1],s)
         push!(span[2],b)
-    end  
+    end
 
-    plot(range(1,iterations), r; ribbon=span)
+    p1 = plot(range(1,iterations), r, label="Trained agent", title="Rewards"; ribbon=span)
+    plot!(range(1,iterations), r_baseline,label="Baseline"; ribbon=span_baseline)
+
+    p2 = plot(1:length(L_e), L_e, title="Entropy Loss", legend=false)
+    p3 = plot(1:length(L_e), L_value, title="Value Loss", legend=false)
+    p4 = plot(1:length(L_e), L_cl, title="CLIP Loss", legend=false)
+    p5 = plot(1:length(L_e), L, title="Loss", legend=false)
+    plot(p1,p2,p3,p4,p5,layout=(5,1),size=(700,800))
+    
 end
 
 main()
