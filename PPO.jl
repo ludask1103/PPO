@@ -88,7 +88,6 @@ function run_policy(
 
         probs = worker.agent.actor(states)
         probs = softmax(probs)
-
         actions = wsample.(rng,Ref(collect(1:size(probs,2))),eachcol(exp.(probs)))
 
         for j in worker.num_environments
@@ -186,21 +185,27 @@ function update_params(
     )
 
     NT = worker.time_steps*worker.num_environments
-    
+
+    batch_advantage = reshape(worker.trajectory.advantage,:)
+    batch_returns   = reshape(worker.trajectory.returns,:)
+    batch_states    = reduce(hcat,[worker.trajectory.state[i,:,j] for j in 1:worker.num_environments for i in 1:worker.time_steps])
+    batch_actions   = reshape(worker.trajectory.action,:)
+    batch_probs     = reduce(hcat,[worker.trajectory.prob[i,:,j] for j in 1:worker.num_environments for i in 1:worker.time_steps])
+
     for k in 1:n_epochs
         batch_ind = create_mini_batches(NT, batch_size)
         
         for (i,ind) in enumerate(batch_ind)
 
-            adv = reshape(worker.trajectory.advantage,:)[ind]
-            adv = (adv.-mean(adv))./(std(adv)+1e-8)
+            advantage = batch_advantage[ind]
+            advantage = (advantage .- mean(advantage))./(std(advantage) + 1e-8)
 
-            returns = reshape(worker.trajectory.returns,:)[ind] 
+            returns = batch_returns[ind] 
             returns = (returns .- mean(returns))./(std(returns) + 1e-8)
             
-            states = transpose(reshape(worker.trajectory.state,:,size(worker.trajectory.state,2)))[:,ind] #litar inte på det här
-            actions = reshape(worker.trajectory.action,:)[ind]
-            prob_old = transpose(reshape(worker.trajectory.prob,:,size(worker.trajectory.prob,2)))[:,ind]
+            states = batch_states[:,ind]
+            actions = batch_actions[ind]
+            prob_old = batch_probs[:,ind]
 
             prob_old_a = prob_old[actions,:]
 
@@ -216,8 +221,8 @@ function update_params(
                 
                 ratio = exp.(prob_a .- prob_old_a)
 
-                surr_1 = ratio.*adv
-                surr_2 = clamp.(ratio,1-ϵ,1+ϵ).*adv
+                surr_1 = ratio.*advantage
+                surr_2 = clamp.(ratio,1-ϵ,1+ϵ).*advantage
 
                 L_clip = mean(min.(surr_1, surr_2))
 
@@ -227,8 +232,7 @@ function update_params(
                 value = worker.agent.critic(states)[1,:]
                 L_vf = Flux.Losses.huber_loss(value,returns)
 
-                ChainRules.ignore_derivatives() do       
-
+                ChainRules.ignore_derivatives() do
                     logger.L_value[logger.index]       = L_vf
                     logger.L_entropy[logger.index]     = L_entropy
                     logger.L_clip[logger.index]        = L_clip
@@ -272,14 +276,14 @@ end
 
 function main()
 
-    lr               = 2.5e-5
-    iterations       = 500
-    time_steps       = 2048
-    num_environments = 4
-    n_epochs         = 4
-    batch_size       = 64*num_environments
+    lr               = 2.5e-4
+    iterations       = 50
+    time_steps       = 512
+    num_environments = 10
+    n_epochs         = 10
+    batch_size       = 64
     c_1              = 0.5
-    c_2              = 0.01
+    c_2              = 0.05
     β                = 0.0
     ϵ                = 0.2
 
@@ -289,14 +293,14 @@ function main()
     num_actions = length(action_space(environment))
     num_states  = length(state_space(environment))
 
-    shared_layer = Dense(num_states => network_size, tanh; init=orthogonal(rng))
+    shared_layer = Dense(num_states => network_size, relu; init=orthogonal(rng))
 
     actor = Chain(shared_layer,
-                    Dense(network_size => network_size,tanh; init=orthogonal(rng)),
+                    Dense(network_size => network_size,relu; init=orthogonal(rng)),
                     Dense(network_size => num_actions; init=orthogonal(rng)))
 
     critic = Chain(shared_layer,
-                    Dense(network_size => network_size,tanh; init=orthogonal(rng)),
+                    Dense(network_size => network_size,relu; init=orthogonal(rng)),
                     Dense(network_size => 1; init=orthogonal(rng)))
 
     optimiser  = Adam(lr)
