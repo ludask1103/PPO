@@ -1,4 +1,4 @@
-using Flux, Plots, ReinforcementLearning, Statistics, Random, ProgressBars, StableRNGs, ChainRules, Printf
+using Flux, Plots, ReinforcementLearning, Statistics, Random, ProgressBars, StableRNGs, ChainRules
 using StatsBase: entropy, wsample
 theme(:ggplot2)
 
@@ -9,25 +9,30 @@ mutable struct Trajectory
     time_steps       ::Int64
     num_states       ::Int64
     num_actions      ::Int64
-    state            ::Array{Float64}
-    action           ::Matrix{Int64}
-    prob             ::Array{Float64}
+    states           ::Array{Float64}
+    actions          ::Matrix{Int64}
+    probs            ::Array{Float64}
     reward           ::Matrix{Float64}
     value            ::Matrix{Float64}
     done             ::Matrix{Bool}
     advantage        ::Matrix{Float64}
     returns          ::Matrix{Float64}
     
-    function Trajectory(num_environments::Int64,time_steps::Int64, num_states::Int64, num_actions::Int64)
-        state     = zeros(Float64, time_steps, num_states, num_environments)
-        action    = zeros(Int64, time_steps, num_environments)
-        prob      = zeros(Float64, time_steps, num_actions, num_environments)
+    function Trajectory(num_environments::Int64,
+                        time_steps::Int64, 
+                        num_states::Int64, 
+                        num_actions::Int64)
+
+        states    = zeros(Float64,num_states, time_steps, num_environments)
+        actions   = zeros(Int64, time_steps, num_environments)
+        probs     = zeros(Float64, num_actions, time_steps, num_environments)
         reward    = zeros(Float64, time_steps, num_environments)
         value     = zeros(Float64, time_steps, num_environments)
         done      = zeros(Bool, time_steps, num_environments)
         advantage = zeros(Float64, time_steps, num_environments)
         returns   = zeros(Float64, time_steps, num_environments)
-        new(num_environments,time_steps, num_states, num_actions, state, action, prob, reward, value, done, advantage, returns)
+
+        new(num_environments,time_steps, num_states, num_actions, states, actions, probs, reward, value, done, advantage, returns)
     end
 end
 
@@ -43,8 +48,13 @@ mutable struct Worker
     time_steps       ::Int64
     num_environments ::Int64
 
-    function Worker(num_environments::Int64,time_steps::Int64,environments::Vector{<:AbstractEnv},actor::Chain,critic::Chain)
-        num_states  = length(state_space(environments[1]))
+    function Worker(num_environments::Int64,
+                    time_steps::Int64,
+                    environments::Vector{<:AbstractEnv},
+                    actor::Chain,
+                    critic::Chain)
+
+        num_states  = length(state(environments[1]))
         num_actions = length(action_space(environments[1]))
         trajectory  = Trajectory(num_environments,time_steps,num_states,num_actions)
 
@@ -88,18 +98,19 @@ function run_policy(
 
         probs = worker.agent.actor(states)
         probs = softmax(probs)
-        actions = wsample.(rng,Ref(collect(1:size(probs,2))),eachcol(exp.(probs)))
 
-        for j in worker.num_environments
-            worker.environments[j](actions[j])
+        actions = wsample.(rng,action_space.(worker.environments),eachcol(probs))
+
+        for j in 1:worker.num_environments
+            act!(worker.environments[j],actions[j]) #wish this could have been nicer
         end
 
         rewards = reward.(worker.environments)
         values = worker.agent.critic(states)
 
-        worker.trajectory.state[i,:,:]  = states
-        worker.trajectory.prob[i,:,:]   = log.(probs)
-        worker.trajectory.action[i,:]   = actions
+        worker.trajectory.states[:,i,:] = states
+        worker.trajectory.probs[:,i,:]  = log.(probs)
+        worker.trajectory.actions[i,:]  = actions
         worker.trajectory.reward[i,:]   = rewards
         worker.trajectory.value[i,:]    = values
         worker.trajectory.done[i,:]     = is_terminated.(worker.environments)
@@ -182,29 +193,31 @@ function update_params(
     β::Float64,
     ϵ::Float64,
     logger::Logger
-    )
+    )::Worker
 
     NT = worker.time_steps*worker.num_environments
 
-    batch_advantage = reshape(worker.trajectory.advantage,:)
-    batch_returns   = reshape(worker.trajectory.returns,:)
-    batch_states    = reduce(hcat,[worker.trajectory.state[i,:,j] for j in 1:worker.num_environments for i in 1:worker.time_steps])
-    batch_actions   = reshape(worker.trajectory.action,:)
-    batch_probs     = reduce(hcat,[worker.trajectory.prob[i,:,j] for j in 1:worker.num_environments for i in 1:worker.time_steps])
+    batch_advantage = flatten_batch(worker.trajectory.advantage)
+    batch_returns   = flatten_batch(worker.trajectory.returns) 
+    batch_states    = flatten_batch(worker.trajectory.states) 
+    batch_actions   = flatten_batch(worker.trajectory.actions) 
+    batch_probs     = flatten_batch(worker.trajectory.probs)
+    batch_values    = flatten_batch(worker.trajectory.value) 
 
     for k in 1:n_epochs
         batch_ind = create_mini_batches(NT, batch_size)
         
-        for (i,ind) in enumerate(batch_ind)
+        for ind in batch_ind
 
             advantage = batch_advantage[ind]
+            returns = batch_values[ind] .+ advantage
             advantage = (advantage .- mean(advantage))./(std(advantage) + 1e-8)
 
-            returns = batch_returns[ind] 
+            #returns = batch_returns[ind] 
             returns = (returns .- mean(returns))./(std(returns) + 1e-8)
             
-            states = batch_states[:,ind]
-            actions = batch_actions[ind]
+            states   = batch_states[:,ind]
+            actions  = batch_actions[ind]
             prob_old = batch_probs[:,ind]
 
             prob_old_a = prob_old[actions,:]
@@ -227,10 +240,10 @@ function update_params(
                 L_clip = mean(min.(surr_1, surr_2))
 
                 L_entropy = mean(entropy.(eachcol(prob)))
-                kl = Flux.kldivergence(prob,exp.(prob_old))
+                kl        = Flux.kldivergence(prob,exp.(prob_old))
 
                 value = worker.agent.critic(states)[1,:]
-                L_vf = Flux.Losses.huber_loss(value,returns)
+                L_vf  = Flux.Losses.huber_loss(value,returns)
 
                 ChainRules.ignore_derivatives() do
                     logger.L_value[logger.index]       = L_vf
@@ -255,43 +268,44 @@ end
 function test_actor(
     actor::Chain,
     environment::AbstractEnv
-    )
+    )::Float64
     rewards = []
-    for _ in 1:20
+    for _ in 1:20 
         reset!(environment)
-        tmp = []    
+        tmp = 0   
         while !is_terminated(environment)
             s = state(environment)
             
             probs = softmax(actor(s))
-            a = wsample(rng,collect(1:length(probs)),probs)
-            
-            environment(a)
-            push!(tmp, reward(environment))
+            action = wsample(rng,action_space(environment),probs)
+
+            act!(environment,action)
+
+            tmp += reward(environment)
         end
-        push!(rewards, sum(tmp))
+        push!(rewards, tmp)
     end
-    return mean(rewards), reduce(min,rewards), reduce(max,rewards)
+    return mean(rewards)
 end
 
 function main()
 
-    lr               = 2.5e-4
-    iterations       = 50
+    lr               = 3e-4
+    iterations       = 1000
     time_steps       = 512
     num_environments = 10
     n_epochs         = 10
     batch_size       = 64
     c_1              = 0.5
-    c_2              = 0.05
+    c_2              = 0.01
     β                = 0.0
-    ϵ                = 0.2
+    ϵ                = 0.2 
 
     network_size = 64
 
     environment = CartPoleEnv(rng=rng)
     num_actions = length(action_space(environment))
-    num_states  = length(state_space(environment))
+    num_states  = length(state(environment))
 
     shared_layer = Dense(num_states => network_size, relu; init=orthogonal(rng))
 
@@ -312,10 +326,8 @@ function main()
     r_baseline = []
     span_baseline = ([],[])
     for i in 1:iterations
-        rew, min_r, max_r = test_actor(actor,environment)
+        rew = test_actor(actor,environment)
         push!(r_baseline, rew)
-        push!(span_baseline[1],min_r)
-        push!(span_baseline[2],max_r)
     end
 
     r = []
@@ -328,17 +340,16 @@ function main()
 
         worker = update_params(optimiser,worker,n_epochs,batch_size,c_1,c_2,β,ϵ,logger)
 
-        rew, min_r, max_r = test_actor(worker.agent.actor, environment)
+        rew = test_actor(worker.agent.actor, environment)
         
         push!(r, rew)
-        push!(span[1],min_r)
-        push!(span[2],max_r)
 
         set_postfix(iter,(Reward=string(rew)))
+
     end
 
-    p1 = plot(range(1,iterations), r; label="Trained agent", title="Rewards", ribbon=span)
-    plot!(range(1,iterations), r_baseline; label="Baseline", ribbon=span_baseline,legend=:topleft)
+    p1 = plot(range(1,iterations), r; label="Trained agent", title="Rewards")
+    plot!(range(1,iterations), r_baseline; label="Baseline",legend=:topleft)
     p2 = plot(1:logger.Size, logger.L_entropy; title="Entropy", legend=false)
     p3 = plot(1:logger.Size, logger.kl_divergence; title="KL Divergence", legend=false)    
     p4 = plot(1:logger.Size, logger.L_clip; title="CLIP Loss", legend=false,xaxis=false)
