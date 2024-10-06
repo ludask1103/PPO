@@ -17,7 +17,6 @@ mutable struct Trajectory
     value            ::Matrix{Float64}
     done             ::Matrix{Bool}
     advantage        ::Matrix{Float64}
-    returns          ::Matrix{Float64}
     
     function Trajectory(num_environments::Int64,
                         time_steps::Int64, 
@@ -31,9 +30,8 @@ mutable struct Trajectory
         value     = zeros(Float64, time_steps, num_environments)
         done      = zeros(Bool, time_steps, num_environments)
         advantage = zeros(Float64, time_steps, num_environments)
-        returns   = zeros(Float64, time_steps, num_environments)
 
-        new(num_environments,time_steps, num_states, num_actions, states, actions, probs, reward, value, done, advantage, returns)
+        new(num_environments,time_steps, num_states, num_actions, states, actions, probs, reward, value, done, advantage)
     end
 end
 
@@ -178,7 +176,6 @@ function update_params(
     NT = worker.time_steps*worker.num_environments
 
     batch_advantage = flatten_batch(worker.trajectory.advantage)
-    batch_returns   = flatten_batch(worker.trajectory.returns) 
     batch_states    = flatten_batch(worker.trajectory.states) 
     batch_actions   = flatten_batch(worker.trajectory.actions) 
     batch_probs     = flatten_batch(worker.trajectory.probs)
@@ -245,9 +242,9 @@ end
 function test_actor(
     actor::Chain,
     environment::AbstractEnv
-    )::Tuple{Float64,Float64}
+    )::Tuple{Float64,Float64,Float64}
     rewards = []
-    for _ in 1:20 
+    for _ in 1:10 
         reset!(environment)
         tmp = 0   
         while !is_terminated(environment)
@@ -262,15 +259,15 @@ function test_actor(
         end
         push!(rewards, tmp)
     end
-    return mean(rewards),std(rewards)
+    return mean(rewards), maximum(rewards)-mean(rewards),mean(rewards)-minimum(rewards) #std(rewards)
 end
 
 function main()
 
     lr               = 2.5e-4
-    iterations       = 500
-    time_steps       = 256
-    num_environments = 10
+    iterations       = 1500
+    time_steps       = 128
+    num_environments = 4
     n_epochs         = 10
     batch_size       = 128
     c_1              = 0.5
@@ -279,13 +276,11 @@ function main()
     ϵ                = 0.2
 
     max_steps    = 500
-    network_size = 32
+    network_size = 64
 
     environment = CartPoleEnv(rng=rng,max_steps=max_steps)
     num_actions = length(action_space(environment))
     num_states  = length(state(environment))
-
-    shared_layer = Dense(num_states => network_size, relu; init=orthogonal(rng))
 
     actor = Chain(Dense(num_states => network_size, relu; init=orthogonal(rng)),
                     Dense(network_size => network_size,relu; init=orthogonal(rng)),
@@ -302,15 +297,19 @@ function main()
     logger = Logger(Int(iterations*time_steps*num_environments*n_epochs/batch_size))
     
     rewards_baseline = zeros(iterations)
-    span_baseline = zeros(iterations)
+    rewards_max_baseline = zeros(iterations)
+    rewards_min_baseline = zeros(iterations)
+
     for i in 1:iterations
-        reward_mean, reward_std = test_actor(actor,environment)
+        reward_mean, rewards_max, rewards_min = test_actor(actor,environment)
         rewards_baseline[i] = reward_mean
-        span_baseline[i] = reward_std
+        rewards_max_baseline[i] = rewards_max
+        rewards_min_baseline[i] = rewards_min
     end
 
     rewards = zeros(iterations)
-    span = zeros(iterations)
+    rewards_max = zeros(iterations)
+    rewards_min = zeros(iterations)
     iter = ProgressBar(1:iterations)
     for i in iter
 
@@ -318,17 +317,17 @@ function main()
 
         worker = update_params(optimiser,worker,n_epochs,batch_size,c_1,c_2,β,ϵ,logger)
 
-        rewards_mean, rewards_std = test_actor(worker.agent.actor, environment)
+        rewards_mean, rewards_max_, rewards_min_ = test_actor(worker.agent.actor, environment)
         
         rewards[i] = rewards_mean
-        span[i] = rewards_std
-
+        rewards_max[i] = rewards_max_
+        rewards_min[i] = rewards_min_
         set_postfix(iter,(Reward=string(rewards_mean)))
 
     end
 
-    p1 = plot(range(1,iterations), rewards; ribbon=span, label="Trained agent", title="Rewards")
-    plot!(range(1,iterations), rewards_baseline; ribbon=span_baseline, label="Baseline",legend=:topleft)
+    p1 = plot(range(1,iterations), rewards; ribbon=(rewards_min,rewards_max), label="Trained agent", title="Rewards")
+    plot!(range(1,iterations), rewards_baseline; ribbon=(rewards_min_baseline,rewards_max_baseline), label="Baseline",legend=:topleft)
     p2 = plot(1:logger.Size, logger.L_entropy; title="Entropy", legend=false)
     p3 = plot(1:logger.Size, logger.kl_divergence; title="KL Divergence", legend=false)    
     p4 = plot(1:logger.Size, logger.L_clip; title="CLIP Loss", legend=false,xaxis=false)
@@ -340,7 +339,7 @@ function main()
     c                      
     d{0.33w} e{0.33w} f{0.33w}
     ]
-    plot(p1,p2,p3,p4,p5,p6,layout=custom_layout,size=(800,1000),titleloc=:left)
+    plot(p1,p2,p3,p4,p5,p6,layout=custom_layout,size=(800,1000),titleloc=:left,fmt=:pdf)
 
 end
 
